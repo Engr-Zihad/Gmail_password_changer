@@ -16,10 +16,14 @@ import csv
 import sys
 import shutil
 import threading
+import hashlib
+import hmac
+import binascii
+import json
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 
 import customtkinter as ctk
 
@@ -67,27 +71,67 @@ def _load_already_succeeded() -> Set[str]:
     return {e for e, s in succeeded.items() if s.startswith("Success")}
 
 
+# ── Cryptographic Security Gate (PBKDF2-HMAC-SHA256) ──────────────────────────
+
+_PBKDF2_SALT = b"gpc_sec_pbkdf2_v4_salt"
+_PBKDF2_ITERATIONS = 200_000
+_PBKDF2_DKLEN = 32
+
+# Master authorized PBKDF2 key digests
+_AUTHORIZED_KEY_DIGESTS = {
+    "0db445333f6f9698da9398a599308e2576f422b6692411cb8135130b64cb7232",
+    "322427e439eaf63c6f2cae5315106abfa5309cbd50d34f92ec4a13111f51a2bf",
+}
+
+# Derived worker engine verification digests
+_VALID_ENGINE_TOKENS = {
+    "4ba091f0fa8f0d014ffa0bb421b8bc57da437cbb567f19ec73811625019488c4",
+    "c527ec363d5629d556411609a000bcc066bf394699aa66ca9ef853ee34b0d47d",
+}
+
+def _derive_auth_credentials(candidate: str) -> Optional[Tuple[str, str]]:
+    """
+    Derive the PBKDF2 digest and engine authorization token.
+    Returns (key_hex, engine_token) if candidate is non-empty, else None.
+    """
+    if not candidate:
+        return None
+    k_bytes = hashlib.pbkdf2_hmac(
+        "sha256", candidate.encode("utf-8"), _PBKDF2_SALT, _PBKDF2_ITERATIONS, _PBKDF2_DKLEN
+    )
+    key_hex = binascii.hexlify(k_bytes).decode("ascii")
+    engine_token = hmac.new(k_bytes, b"gpc_engine_exec_v4", hashlib.sha256).hexdigest()
+    return key_hex, engine_token
+
+
 # ── Security Lock Screen ───────────────────────────────────────────────────────
 
-class LockScreen(ctk.CTkToplevel):
+class SecurityLockWindow(ctk.CTkToplevel):
     """
     Modal security gate dialog shown before main window reveals.
-    Only allows access if correct password is provided.
+    Enforces PBKDF2 verification, attempt limits, progressive cooldowns,
+    and runtime engine token initialization.
     """
     def __init__(self, master):
         super().__init__(master)
         self.master = master
         self.title("🔐 ZIHAD Gmail pw changer — Security Lock")
-        self.geometry("400x260")
+        self.geometry("440x290")
         self.resizable(False, False)
+
+        # Rate-limiting state
+        self._failed_attempts = 0
+        self._max_attempts = 5
+        self._cooldown_active = False
+        self._cooldown_remaining = 0
 
         # Center on screen
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        x = (sw - 400) // 2
-        y = (sh - 260) // 2
-        self.geometry(f"400x260+{x}+{y}")
+        x = (sw - 440) // 2
+        y = (sh - 290) // 2
+        self.geometry(f"440x290+{x}+{y}")
 
         self.attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -102,11 +146,19 @@ class LockScreen(ctk.CTkToplevel):
         # Title label
         title_lbl = ctk.CTkLabel(
             container,
-            text="Enter Security Password to Unlock",
-            font=("Segoe UI", 15, "bold"),
+            text="🔐  Operator Access Authorization",
+            font=("Segoe UI", 16, "bold"),
             text_color="#5DADE2",
         )
-        title_lbl.pack(pady=(4, 14))
+        title_lbl.pack(pady=(4, 6))
+
+        subtitle_lbl = ctk.CTkLabel(
+            container,
+            text="Enter authorized cryptographic access key to initialize core engine",
+            font=FONT_SMALL,
+            text_color=COLOR_MUTED,
+        )
+        subtitle_lbl.pack(pady=(0, 14))
 
         # Password input row
         pw_row = ctk.CTkFrame(container, fg_color="transparent")
@@ -116,7 +168,7 @@ class LockScreen(ctk.CTkToplevel):
         self.pw_entry = ctk.CTkEntry(
             pw_row,
             textvariable=self.pw_var,
-            placeholder_text="Enter password…",
+            placeholder_text="Enter operator passcode…",
             font=FONT_LABEL,
             height=38,
             show="•",
@@ -148,7 +200,7 @@ class LockScreen(ctk.CTkToplevel):
         # Unlock button
         self.unlock_btn = ctk.CTkButton(
             container,
-            text="Unlock App",
+            text="Authorize & Unlock Engine",
             font=FONT_BUTTON,
             height=40,
             fg_color="#1ABC9C",
@@ -166,20 +218,101 @@ class LockScreen(ctk.CTkToplevel):
             self.toggle_btn.configure(text="Show")
 
     def _verify(self):
-        val = self.pw_var.get().strip()
-        if val in ("2580Zihad!", "2580Zihad!."):
+        if self._cooldown_active:
+            return
+
+        candidate = self.pw_var.get().strip()
+        creds = _derive_auth_credentials(candidate)
+        if not creds:
+            self.status_lbl.configure(text="❌ Key cannot be empty.", text_color=COLOR_FAIL)
+            return
+
+        key_hex, engine_token = creds
+        is_valid = any(hmac.compare_digest(key_hex, auth_hex) for auth_hex in _AUTHORIZED_KEY_DIGESTS)
+
+        if is_valid:
+            # Secondary configuration check
+            cfg_path = Path(__file__).parent / "gpc_config.json"
+            if not cfg_path.exists():
+                self.status_lbl.configure(
+                    text="❌ Security Fault: gpc_config.json not found.",
+                    text_color=COLOR_FAIL,
+                )
+                return
+
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if cfg.get("system") != "ZIHAD_GPC_CORE" or cfg.get("security_mode") != "hardened":
+                    self.status_lbl.configure(
+                        text="❌ Security Fault: Invalid configuration schema.",
+                        text_color=COLOR_FAIL,
+                    )
+                    return
+            except Exception:
+                self.status_lbl.configure(
+                    text="❌ Security Fault: Corrupted configuration file.",
+                    text_color=COLOR_FAIL,
+                )
+                return
+
+            # Bind cryptographic engine token to master application instance
+            self.master._engine_token = engine_token
             self.destroy()
             self.master.deiconify()
             self.master.lift()
             self.master.focus_force()
         else:
-            self.status_lbl.configure(text="❌ Incorrect password! Access denied.", text_color=COLOR_FAIL)
+            self._failed_attempts += 1
+            if self._failed_attempts >= self._max_attempts:
+                self.pw_entry.configure(state="disabled")
+                self.unlock_btn.configure(state="disabled")
+                self.status_lbl.configure(
+                    text=f"❌ Maximum attempts exceeded ({self._max_attempts}/{self._max_attempts}). Terminal locked.",
+                    text_color=COLOR_FAIL,
+                )
+                self.after(2500, self._on_lockout_exit)
+            else:
+                cooldown_delay = self._failed_attempts * 3
+                self._start_cooldown(cooldown_delay)
+
+    def _start_cooldown(self, delay: int):
+        self._cooldown_active = True
+        self._cooldown_remaining = delay
+        self.unlock_btn.configure(state="disabled")
+        self.pw_entry.configure(state="disabled")
+        self._tick_cooldown()
+
+    def _tick_cooldown(self):
+        if self._cooldown_remaining > 0:
+            self.status_lbl.configure(
+                text=f"❌ Access denied. Cooldown: {self._cooldown_remaining}s (Attempt {self._failed_attempts}/{self._max_attempts})",
+                text_color=COLOR_FAIL,
+            )
+            self._cooldown_remaining -= 1
+            self.after(1000, self._tick_cooldown)
+        else:
+            self._cooldown_active = False
+            self.unlock_btn.configure(state="normal")
+            self.pw_entry.configure(state="normal")
             self.pw_entry.delete(0, "end")
+            self.status_lbl.configure(
+                text=f"Ready for retry (Attempt {self._failed_attempts}/{self._max_attempts})",
+                text_color=COLOR_WARN,
+            )
             self.pw_entry.focus_set()
+
+    def _on_lockout_exit(self):
+        self.master.destroy()
+        sys.exit(1)
 
     def _on_close(self):
         self.master.destroy()
         sys.exit(0)
+
+
+# Backward compatibility alias
+LockScreen = SecurityLockWindow
 
 
 # ── Main window ────────────────────────────────────────────────────────────────
@@ -215,7 +348,7 @@ class App(ctk.CTk):
         self._build_ui()
 
         # Display centered security lock screen
-        self.lock_screen = LockScreen(self)
+        self.lock_screen = SecurityLockWindow(self)
 
     # ══════════════════════════════════════════════════════════════════════
     # UI Construction
@@ -657,6 +790,7 @@ class App(ctk.CTk):
             on_progress=self._on_progress_update,
             on_account_done=self._on_account_done,
             on_all_done=self._on_all_done,
+            auth_token=getattr(self, "_engine_token", None),
         )
         self._worker.start()
 

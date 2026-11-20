@@ -1,5 +1,7 @@
-customtkinter>=5.2.2
+# ZIHAD Gmail Bulk Password Changer - Core Runtime Dependencies
+# Run: pip install -r requirements.txt
+
+customtkinter>=5.2.0
 playwright>=1.44.0
 requests>=2.31.0
-pandas>=2.1.0
 Pillow>=10.0.0

@@ -1,0 +1,6 @@
+{
+  "system": "ZIHAD_GPC_CORE",
+  "security_mode": "hardened",
+  "min_delay_sec": 5,
+  "max_batch_size": 1000
+}

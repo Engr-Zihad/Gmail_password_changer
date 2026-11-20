@@ -19,6 +19,9 @@ import os
 import time
 import threading
 import traceback
+import json
+import hmac
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Callable, Optional
@@ -33,15 +36,17 @@ from playwright.sync_api import (
 )
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Constants & Engine Authorization ───────────────────────────────────────────
 
-if getattr(sys, "frozen", False):
-    APP_DIR = Path(sys.executable).parent
-else:
-    APP_DIR = Path(__file__).parent.resolve()
-
+APP_DIR = Path(__file__).parent.resolve()
 RESULTS_FILE = APP_DIR / "password_update_results.csv"
 CSV_HEADERS  = ["Email", "Old Password", "New Password", "Status", "Timestamp", "Notes"]
+
+# Authorized engine token digests derived cryptographically from master keys
+_VALID_ENGINE_TOKENS = {
+    "4ba091f0fa8f0d014ffa0bb421b8bc57da437cbb567f19ec73811625019488c4",
+    "c527ec363d5629d556411609a000bcc066bf394699aa66ca9ef853ee34b0d47d",
+}
 
 # Navigate directly to PW-change page; ?hl=en locks English UI text
 URL_PW_CHANGE = "https://myaccount.google.com/signinoptions/password?hl=en"
@@ -538,6 +543,7 @@ class PasswordChangerWorker:
         on_progress:     Callable[[int, int, int, int], None],
         on_account_done: Callable[[str, str], None],
         on_all_done:     Callable[[], None],
+        auth_token:      Optional[str] = None,
     ):
         self.accounts        = accounts
         self.new_password    = new_password
@@ -547,10 +553,29 @@ class PasswordChangerWorker:
         self.on_progress     = on_progress
         self.on_account_done = on_account_done
         self.on_all_done     = on_all_done
+        self.auth_token      = auth_token
 
         self._paused  = False
         self._stopped = False
         self._thread: Optional[threading.Thread] = None
+
+    def _verify_engine_authorization(self) -> bool:
+        """Verify runtime cryptographic signature and local config integrity."""
+        if not self.auth_token or not isinstance(self.auth_token, str):
+            return False
+        if not any(hmac.compare_digest(self.auth_token, valid) for valid in _VALID_ENGINE_TOKENS):
+            return False
+        config_path = APP_DIR / "gpc_config.json"
+        if not config_path.exists():
+            return False
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("system") != "ZIHAD_GPC_CORE" or cfg.get("security_mode") != "hardened":
+                return False
+        except Exception:
+            return False
+        return True
 
     # ── Public control API ─────────────────────────────────────────────────
 
@@ -578,6 +603,13 @@ class PasswordChangerWorker:
     # ── Worker thread ──────────────────────────────────────────────────────
 
     def _run(self):
+        # ── Cryptographic Session & Integrity Verification ────────────────────
+        if not self._verify_engine_authorization():
+            self.on_log("❌ FATAL: Engine authorization failure. Security gate was bypassed or session invalid.")
+            self.on_log("   Core automation routines cannot proceed without valid authorization.")
+            self.on_all_done()
+            return
+
         total         = len(self.accounts)
         success_count = 0
         failed_count  = 0

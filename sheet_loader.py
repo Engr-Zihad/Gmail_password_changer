@@ -158,13 +158,18 @@ def load_accounts(sheet_url: str) -> Tuple[List[Dict[str, str]], str]:
 
         email    = row[0].strip()
         password = row[1].strip()
+        recovery = row[2].strip() if len(row) > 2 else ""
 
         # Must have both values and email must look valid (contains '@')
         if not email or not password or "@" not in email:
             skipped_short += 1
             continue
 
-        accounts.append({"email": email, "password": password})
+        accounts.append({
+            "email": email,
+            "password": password,
+            "recovery": recovery,
+        })
 
     # ── Never return an empty list silently ───────────────────────────────
     if not accounts:
@@ -183,7 +188,8 @@ def load_accounts(sheet_url: str) -> Tuple[List[Dict[str, str]], str]:
             f"Scanned {total_rows} total row(s). {detail}\n\n"
             "Expected layout:\n"
             "  Column A = Email address (must contain '@')\n"
-            "  Column B = Current password\n\n"
+            "  Column B = Current password\n"
+            "  Column C = Recovery email (optional)\n\n"
             "If you edited the sheet recently, wait 10 seconds and try again "
             "(Google caches exports briefly)."
         )
